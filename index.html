@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Smart Traffic Management - AI Simulation</title>
+<style>
+  body{margin:0;font-family:Segoe UI,Arial,sans-serif;background:#111827;color:#e5e7eb;display:flex;flex-wrap:wrap;justify-content:center;gap:20px;padding:20px}
+  canvas{background:#3f6212;border-radius:10px;box-shadow:0 0 20px #0008;max-width:100%}
+  .panel{width:300px;display:flex;flex-direction:column;gap:12px}
+  h1{font-size:20px;margin:0}
+  .card{background:#1f2937;border-radius:10px;padding:12px}
+  button{width:100%;padding:9px;margin:3px 0;border:0;border-radius:6px;font-weight:600;cursor:pointer;background:#374151;color:#fff}
+  button.amb{background:#dc2626}
+  button.on{background:#16a34a}
+  .row{display:flex;justify-content:space-between;font-size:14px;margin:3px 0}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+  input{width:100%}
+  #mode{font-weight:700}
+  small{color:#9ca3af}
+</style>
+</head>
+<body>
+<canvas id="c" width="600" height="600"></canvas>
+<div class="panel">
+  <h1>🚦 Smart Traffic Management</h1>
+  <small>Adaptive AI signal control + emergency vehicle priority</small>
+
+  <div class="card">
+    <div class="row"><span>Controller</span><span id="mode">-</span></div>
+    <button id="toggle" class="on">AI Adaptive: ON</button>
+    <small>Turn OFF to compare with a fixed 10s timer.</small>
+  </div>
+
+  <div class="card">
+    <b>🚑 Send Ambulance from</b>
+    <div class="grid">
+      <button class="amb" onclick="spawn('N',true)">North</button>
+      <button class="amb" onclick="spawn('S',true)">South</button>
+      <button class="amb" onclick="spawn('W',true)">West</button>
+      <button class="amb" onclick="spawn('E',true)">East</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="row"><span>Simulation speed</span><span id="sv">0.5x</span></div>
+    <input id="speed" type="range" min="0.1" max="2" step="0.1" value="0.5">
+    <button id="det" class="on">Camera detection: ON</button>
+    <small>Green box = car detected (with confidence), red = ambulance.</small>
+  </div>
+
+  <div class="card">
+    <div class="row"><span>Traffic density</span><span id="dv">5</span></div>
+    <input id="density" type="range" min="1" max="10" value="5">
+    <div class="row"><span>Heavy lane (rush)</span><span id="heavy">-</span></div>
+  </div>
+
+  <div class="card">
+    <b>Live sensor data (queue length)</b>
+    <div class="row"><span>North</span><span id="qN">0</span></div>
+    <div class="row"><span>South</span><span id="qS">0</span></div>
+    <div class="row"><span>West</span><span id="qW">0</span></div>
+    <div class="row"><span>East</span><span id="qE">0</span></div>
+    <hr style="border-color:#374151">
+    <div class="row"><span>Green phase</span><span id="phase">-</span></div>
+    <div class="row"><span>Green time budget</span><span id="budget">-</span></div>
+    <div class="row"><span>Cars passed</span><span id="passed">0</span></div>
+    <div class="row"><span>Avg wait time</span><span id="wait">0s</span></div>
+  </div>
+</div>
+
+<script>
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+const W = 600, C = 300, STOP = 255, CAR_LEN = 22;
+const DIRS = ['N','S','W','E'];
+const AXIS = {N:'NS', S:'NS', W:'EW', E:'EW'};
+
+let cars = [], showDet = true, nextId = 1, adaptive = true, passed = 0, totalWait = 0, waitCount = 0;
+let ctrl = {phase:'NS', light:'green', t:0, budget:10, emergency:null};
+let weights = {N:1,S:1,W:1,E:1}, heavy = '-', rushTimer = 0;
+
+// Position on screen from distance travelled (s)
+function pos(d, s){
+  if(d==='N') return {x:C-20, y:s, a:Math.PI/2};
+  if(d==='S') return {x:C+20, y:W-s, a:-Math.PI/2};
+  if(d==='W') return {x:s, y:C+20, a:0};
+  return {x:W-s, y:C-20, a:Math.PI};
+}
+
+function spawn(d, amb=false){
+  const last = cars.filter(c=>c.d===d).reduce((m,c)=>Math.min(m,c.s), 999);
+  if(last < CAR_LEN+10) return false;
+  const colors = ['#facc15','#60a5fa','#f472b6','#a78bfa','#fb923c','#34d399'];
+  cars.push({id:nextId++, conf:(amb?97+Math.random()*2.9:82+Math.random()*16)|0, d, s:-5, v:0, amb, wait:0, color:amb?'#fff':colors[Math.random()*colors.length|0]});
+  return true;
+}
+
+// ---------------- AI SIGNAL CONTROLLER ----------------
+function queue(d){ return cars.filter(c=>c.d===d && c.s<STOP+2 && c.v<0.5).length; }
+function axisQueue(ax){ return ax==='NS' ? queue('N')+queue('S') : queue('W')+queue('E'); }
+
+function updateController(dt){
+  ctrl.t += dt;
+  const other = ctrl.phase==='NS' ? 'EW' : 'NS';
+
+  // 1) Emergency override: ambulance that hasn't crossed the junction yet
+  const amb = cars.find(c=>c.amb && c.s < C+30);
+  ctrl.emergency = amb ? amb.d : null;
+
+  if(ctrl.light==='yellow'){
+    if(ctrl.t > 3){ ctrl.phase = other; ctrl.light='green'; ctrl.t=0; }
+    return;
+  }
+
+  if(amb){
+    if(AXIS[amb.d] !== ctrl.phase){ ctrl.light='yellow'; ctrl.t=0; }
+    return; // hold green for ambulance
+  }
+
+  if(adaptive){
+    // 2) Adaptive green time: proportional to the queue being served
+    const qCur = axisQueue(ctrl.phase), qOther = axisQueue(other);
+    ctrl.budget = Math.min(25, 5 + qCur*1.5);
+    const minGreen = 6;
+    if(ctrl.t > minGreen && (
+        ctrl.t > ctrl.budget ||               // budget used up
+        (qCur===0 && qOther>0) ||             // nobody waiting here
+        qOther > qCur*2 + 3)){                // other side much busier
+      ctrl.light='yellow'; ctrl.t=0;
+    }
+  } else {
+    ctrl.budget = 10;
+    if(ctrl.t > 10){ ctrl.light='yellow'; ctrl.t=0; }
+  }
+}
+
+// ---------------- VEHICLE MOVEMENT ----------------
+function updateCars(dt){
+  for(const c of cars){
+    const ahead = cars.filter(o=>o.d===c.d && o.s>c.s).reduce((m,o)=>(!m||o.s<m.s)?o:m, null);
+    let gap = ahead ? ahead.s - CAR_LEN - c.s - 6 : 999;
+    const green = ctrl.light==='green' && ctrl.phase===AXIS[c.d];
+    if(!green && c.s <= STOP && !(c.amb && ctrl.emergency===c.d && ctrl.light==='green'))
+      gap = Math.min(gap, STOP - c.s);
+    const vmax = c.amb ? 3.2 : 2;
+    c.v = Math.min(vmax, Math.max(0, gap) * 0.2);
+    c.s += c.v * dt * 60;
+    if(c.v < 0.3 && c.s < STOP+2) c.wait += dt;
+  }
+  cars = cars.filter(c=>{
+    if(c.s > W + 30){ passed++; totalWait += c.wait; waitCount++; return false; }
+    return true;
+  });
+}
+
+// ---------------- DRAWING ----------------
+function drawLight(x, y, ax){
+  ctx.fillStyle='#111'; ctx.fillRect(x-9, y-25, 18, 50);
+  const on = ctrl.phase===ax;
+  const col = !on ? 'R' : ctrl.light==='yellow' ? 'Y' : 'G';
+  [['R','#ef4444',-15],['Y','#facc15',0],['G','#22c55e',15]].forEach(([k,c,dy])=>{
+    ctx.beginPath(); ctx.arc(x, y+dy, 6, 0, 7);
+    ctx.fillStyle = col===k ? c : '#333'; ctx.fill();
+  });
+}
+
+function draw(){
+  ctx.clearRect(0,0,W,W);
+  // roads
+  ctx.fillStyle='#374151'; ctx.fillRect(C-40,0,80,W); ctx.fillRect(0,C-40,W,80);
+
+  // green corridor for ambulance
+  if(ctrl.emergency){
+    const pulse = 0.35 + 0.2*Math.sin(Date.now()/150);
+    ctx.fillStyle = `rgba(34,197,94,${pulse})`;
+    const d = ctrl.emergency;
+    if(d==='N') ctx.fillRect(C-40,0,40,W);
+    if(d==='S') ctx.fillRect(C,0,40,W);
+    if(d==='W') ctx.fillRect(0,C,W,40);
+    if(d==='E') ctx.fillRect(0,C-40,W,40);
+  }
+
+  // lane markings
+  ctx.strokeStyle='#e5e7eb'; ctx.setLineDash([14,12]); ctx.lineWidth=2;
+  ctx.beginPath(); ctx.moveTo(C,0); ctx.lineTo(C,C-40); ctx.moveTo(C,C+40); ctx.lineTo(C,W);
+  ctx.moveTo(0,C); ctx.lineTo(C-40,C); ctx.moveTo(C+40,C); ctx.lineTo(W,C); ctx.stroke();
+  ctx.setLineDash([]); ctx.lineWidth=4; ctx.strokeStyle='#fff';
+  ctx.beginPath();
+  ctx.moveTo(C-40,C-42); ctx.lineTo(C,C-42);  ctx.moveTo(C,C+42); ctx.lineTo(C+40,C+42);
+  ctx.moveTo(C-42,C); ctx.lineTo(C-42,C+40);  ctx.moveTo(C+42,C-40); ctx.lineTo(C+42,C);
+  ctx.stroke();
+
+  // lights
+  drawLight(C-60, C-70, 'NS'); drawLight(C+60, C+70, 'NS');
+  drawLight(C-70, C+60, 'EW'); drawLight(C+70, C-60, 'EW');
+
+  // cars
+  for(const c of cars){
+    const p = pos(c.d, c.s);
+    ctx.save(); ctx.translate(p.x,p.y); ctx.rotate(p.a);
+    ctx.fillStyle = c.color; ctx.fillRect(-CAR_LEN, -9, CAR_LEN, 18);
+    ctx.fillStyle='#0006'; ctx.fillRect(-9,-7,6,14);
+    if(c.amb){
+      ctx.fillStyle='#dc2626'; ctx.fillRect(-15,-2,8,4); ctx.fillRect(-13,-5,4,10);
+      ctx.fillStyle = (Date.now()/120|0)%2 ? '#ef4444' : '#3b82f6';
+      ctx.fillRect(-4,-9,4,18);
+    }
+    ctx.restore();
+  }
+
+  // camera detection zones
+  if(showDet){
+    ctx.font='10px Consolas, monospace';
+    DIRS.forEach(d=>{
+      const p1=pos(d,STOP-150), p2=pos(d,STOP);
+      ctx.fillStyle='rgba(56,189,248,0.15)'; ctx.strokeStyle='#38bdf8'; ctx.setLineDash([5,4]); ctx.lineWidth=1;
+      let x,y,w,h;
+      if(d==='N'||d==='S'){ x=p1.x-18; y=Math.min(p1.y,p2.y); w=36; h=150; }
+      else { x=Math.min(p1.x,p2.x); y=p1.y-18; w=150; h=36; }
+      ctx.fillRect(x,y,w,h); ctx.strokeRect(x,y,w,h); ctx.setLineDash([]);
+      ctx.fillStyle='#38bdf8'; ctx.fillText('CAM '+d+' n='+queue(d), x, y-3);
+    });
+    for(const c of cars){
+      const p=pos(c.d,c.s), cx=p.x+Math.cos(p.a)*(-CAR_LEN/2), cy=p.y+Math.sin(p.a)*(-CAR_LEN/2);
+      const vert=(c.d==='N'||c.d==='S'), bw=vert?26:CAR_LEN+8, bh=vert?CAR_LEN+8:26;
+      const col=c.amb?'#ef4444':'#22c55e';
+      ctx.strokeStyle=col; ctx.lineWidth=2; ctx.strokeRect(cx-bw/2,cy-bh/2,bw,bh);
+      const label=c.amb?'AMBULANCE '+c.conf+'%':c.conf+'%';
+      const tw=ctx.measureText(label).width+4;
+      ctx.fillStyle=col; ctx.fillRect(cx-bw/2,cy-bh/2-11,tw,11);
+      ctx.fillStyle='#000'; ctx.fillText(label,cx-bw/2+2,cy-bh/2-2);
+    }
+
+    // per-lane detected count badges on the grass
+    const badgePos = {N:[120,110], S:[360,480], W:[40,380], E:[420,190]};
+    ctx.font='bold 16px Segoe UI';
+    DIRS.forEach(d=>{
+      const n = cars.filter(c=>c.d===d && c.s < STOP+2).length;
+      const [bx,by] = badgePos[d];
+      ctx.fillStyle='rgba(0,0,0,0.7)'; ctx.fillRect(bx,by,140,46);
+      ctx.strokeStyle='#22c55e'; ctx.lineWidth=2; ctx.strokeRect(bx,by,140,46);
+      ctx.fillStyle='#9ca3af'; ctx.font='11px Segoe UI'; ctx.fillText('CAMERA '+d+' LANE',bx+8,by+15);
+      ctx.fillStyle='#22c55e'; ctx.font='bold 18px Segoe UI'; ctx.fillText(n+' detected',bx+8,by+37);
+    });
+  }
+
+  // labels
+  ctx.fillStyle='#fff'; ctx.font='bold 14px Segoe UI';
+  ctx.fillText('N',C-25,20); ctx.fillText('S',C+15,W-8); ctx.fillText('W',6,C+35); ctx.fillText('E',W-18,C-25);
+  if(ctrl.emergency){
+    ctx.fillStyle='#dc2626'; ctx.fillRect(150,10,300,30);
+    ctx.fillStyle='#fff'; ctx.fillText('🚑 EMERGENCY: GREEN CORRIDOR ACTIVE',170,30);
+  }
+}
+
+// ---------------- UI ----------------
+function updateUI(){
+  DIRS.forEach(d=>document.getElementById('q'+d).textContent = queue(d));
+  document.getElementById('phase').textContent = ctrl.phase + ' (' + ctrl.light + ')';
+  document.getElementById('budget').textContent = ctrl.emergency ? 'HOLD (ambulance)' : ctrl.budget.toFixed(1)+'s';
+  document.getElementById('passed').textContent = passed;
+  document.getElementById('wait').textContent = (waitCount? totalWait/waitCount : 0).toFixed(1)+'s';
+  document.getElementById('heavy').textContent = heavy;
+  document.getElementById('mode').textContent = ctrl.emergency ? 'EMERGENCY' : adaptive ? 'AI Adaptive' : 'Fixed Timer';
+}
+
+document.getElementById('det').onclick = e=>{
+  showDet=!showDet; e.target.textContent='Camera detection: '+(showDet?'ON':'OFF'); e.target.className=showDet?'on':'';
+};
+const spd=document.getElementById('speed');
+spd.oninput=()=>document.getElementById('sv').textContent=(+spd.value).toFixed(1)+'x';
+document.getElementById('toggle').onclick = e=>{
+  adaptive = !adaptive; passed = totalWait = waitCount = 0;
+  e.target.textContent = 'AI Adaptive: ' + (adaptive?'ON':'OFF');
+  e.target.className = adaptive ? 'on' : '';
+};
+const dens = document.getElementById('density');
+dens.oninput = ()=>document.getElementById('dv').textContent = dens.value;
+
+// ---------------- MAIN LOOP ----------------
+let last = performance.now();
+function loop(now){
+  const dt = Math.min(0.05, (now-last)/1000) * spd.value; last = now;
+
+  // change which road is busy every 20s (simulates rush hour)
+  rushTimer -= dt;
+  if(rushTimer <= 0){
+    rushTimer = 20; heavy = DIRS[Math.random()*4|0];
+    DIRS.forEach(d=>weights[d] = d===heavy ? 3 : 0.7);
+  }
+  DIRS.forEach(d=>{ if(Math.random() < dt * dens.value * 0.12 * weights[d]) spawn(d); });
+
+  updateController(dt);
+  updateCars(dt);
+  draw(); updateUI();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
